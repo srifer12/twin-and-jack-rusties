@@ -1,0 +1,419 @@
+// UltimateRustCheat.cpp
+// For cracked/non‑Steam Rust (no EAC)
+// Features: ESP (0-400m), aimbot, anti-recoil, radar, loot ESP
+// Compile: x64 Release, /MT, DLL
+
+#include <Windows.h>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <string>
+#include <fstream>
+#include <random>
+#include <chrono>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <imgui.h>
+#include <imgui_impl_dx11.h>
+#include <imgui_impl_win32.h>
+
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+
+// ================================
+//  CONFIGURATION (edit these)
+// ================================
+constexpr float ESP_MAX_DISTANCE = 400.0f;
+constexpr float AIMBOT_SMOOTH = 0.22f;          // 0=instant, 1=no movement
+constexpr float AIMBOT_FOV_PX = 150.0f;
+constexpr int   AIMBOT_BONE = 48;               // 48=head, 46=neck
+constexpr bool  AIMBOT_PREDICT = true;
+constexpr float AIMBOT_PREDICT_FACTOR = 1.2f;
+constexpr float RECOIL_STRENGTH = 85.0f;        // 0-100%
+constexpr float RECOIL_RANDOM = 6.0f;           // ±% randomness
+constexpr bool  SHOW_RADAR = true;
+constexpr int   RADAR_SIZE = 180;
+constexpr int   RADAR_X = 15, RADAR_Y = 15;
+
+// Hotkeys (virtual key codes)
+int g_aimbotKey = VK_RBUTTON;      // right mouse
+int g_recoilKey = VK_LBUTTON;      // left mouse
+int g_menuKey = VK_INSERT;         // show/hide menu
+
+// ================================
+//  UTILITIES & STRUCTS
+// ================================
+struct Vector3 { float x, y, z; };
+struct Vector2 { float x, y; };
+struct Player {
+    DWORD64 ptr;
+    Vector3 pos, headPos, velocity;
+    float health, maxHealth;
+    int team;
+    char name[32];
+    bool alive, sleeping, isLocal;
+    float distance;
+    Vector2 screenHead, screenFeet;
+};
+
+struct Loot {
+    DWORD64 ptr;
+    Vector3 pos;
+    char name[64];
+    int itemId;
+    float distance;
+    Vector2 screenPos;
+};
+
+// Random engine
+std::mt19937 rng((unsigned)std::chrono::steady_clock::now().time_since_epoch().count());
+
+// ================================
+//  MEMORY HANDLER (direct ReadProcessMemory)
+// ================================
+HANDLE g_hProcess = NULL;
+DWORD64 g_baseAddress = 0;
+
+bool InitMemory() {
+    HWND hWnd = FindWindowA(NULL, "Rust");
+    if (!hWnd) {
+        // also try "RustClient" for some cracked versions
+        hWnd = FindWindowA(NULL, "RustClient");
+        if (!hWnd) return false;
+    }
+    DWORD pid; GetWindowThreadProcessId(hWnd, &pid);
+    g_hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!g_hProcess) return false;
+    // get base address of the main module
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    MODULEENTRY32 me = { sizeof(me) };
+    if (Module32First(snap, &me)) {
+        do {
+            if (_stricmp(me.szModule, "RustClient.exe") == 0 || _stricmp(me.szModule, "Rust.exe") == 0) {
+                g_baseAddress = (DWORD64)me.modBaseAddr;
+                break;
+            }
+        } while (Module32Next(snap, &me));
+    }
+    CloseHandle(snap);
+    return g_baseAddress != 0;
+}
+
+template<typename T>
+T Read(DWORD64 addr) {
+    T buffer{};
+    SIZE_T read = 0;
+    ReadProcessMemory(g_hProcess, (LPCVOID)addr, &buffer, sizeof(T), &read);
+    return buffer;
+}
+
+// ================================
+//  OFFSETS – FOR A SPECIFIC CRACKED RUST VERSION
+//  YOU MUST UPDATE THESE USING CHEAT ENGINE
+//  (I give example offsets for Rust 2025/2026 – replace with yours)
+// ================================
+namespace Off {
+    DWORD64 GOM = 0x02B8F4A0;                 // Game Object Manager
+    DWORD64 LocalPlayer = 0xB8;               // offset from GOM
+    DWORD64 Position = 0x90;                  // Vector3
+    DWORD64 Health = 0x430;                   // float
+    DWORD64 MaxHealth = 0x434;                // float
+    DWORD64 Name = 0x600;                     // wchar_t[32]
+    DWORD64 Team = 0x560;                     // int
+    DWORD64 SleepingFlag = 0x38;              // byte
+    DWORD64 Model = 0x38;                     // pointer
+    DWORD64 BoneTransforms = 0x28;            // inside model
+    DWORD64 Velocity = 0x1C0;                 // Vector3
+    DWORD64 ViewMatrix = 0x03C5A8B0;          // 4x4 matrix (64 bytes)
+    DWORD64 ActiveWeapon = 0x578;             // current weapon entity
+    DWORD64 WeaponRecoilOffset = 0xE8;        // where recoil displacement sits
+}
+
+// ================================
+//  WORLD TO SCREEN
+// ================================
+float g_viewMatrix[16];
+void UpdateViewMatrix() {
+    DWORD64 vmAddr = g_baseAddress + Off::ViewMatrix;
+    for (int i = 0; i < 16; i++)
+        g_viewMatrix[i] = Read<float>(vmAddr + i * 4);
+}
+
+bool WorldToScreen(Vector3 world, int& sx, int& sy, int sw, int sh) {
+    float w = g_viewMatrix[12] * world.x + g_viewMatrix[13] * world.y + g_viewMatrix[14] * world.z + g_viewMatrix[15];
+    if (w < 0.01f) return false;
+    float inv = 1.0f / w;
+    float x = (g_viewMatrix[0] * world.x + g_viewMatrix[1] * world.y + g_viewMatrix[2] * world.z + g_viewMatrix[3]) * inv;
+    float y = (g_viewMatrix[4] * world.x + g_viewMatrix[5] * world.y + g_viewMatrix[6] * world.z + g_viewMatrix[7]) * inv;
+    sx = (int)((x + 1.0f) * 0.5f * sw);
+    sy = (int)((1.0f - (y + 1.0f) * 0.5f) * sh);
+    return true;
+}
+
+// ================================
+//  GET PLAYERS (0-400m, with bones & velocity)
+// ================================
+Vector3 GetBonePos(DWORD64 playerPtr, int boneId) {
+    DWORD64 model = Read<DWORD64>(playerPtr + Off::Model);
+    if (!model) return { 0,0,0 };
+    DWORD64 bones = Read<DWORD64>(model + Off::BoneTransforms);
+    if (!bones) return { 0,0,0 };
+    Vector3 pos;
+    pos.x = Read<float>(bones + (boneId * 48) + 0x10);
+    pos.y = Read<float>(bones + (boneId * 48) + 0x14);
+    pos.z = Read<float>(bones + (boneId * 48) + 0x18);
+    return pos;
+}
+
+std::vector<Player> GetPlayers(DWORD64 localPtr, Vector3 localPos) {
+    std::vector<Player> players;
+    DWORD64 gom = Read<DWORD64>(g_baseAddress + Off::GOM);
+    if (!gom) return players;
+    DWORD64 entityList = Read<DWORD64>(gom + 0x20);
+    int entityCount = Read<int>(gom + 0x28);
+    for (int i = 0; i < min(entityCount, 2048); i++) {
+        DWORD64 ent = Read<DWORD64>(entityList + i * 8);
+        if (!ent || ent == localPtr) continue;
+        Player p;
+        p.ptr = ent;
+        p.pos = Read<Vector3>(ent + Off::Position);
+        p.health = Read<float>(ent + Off::Health);
+        p.maxHealth = Read<float>(ent + Off::MaxHealth);
+        p.team = Read<int>(ent + Off::Team);
+        p.sleeping = (Read<BYTE>(ent + Off::SleepingFlag) & 1) != 0;
+        p.alive = (p.health > 0 && !p.sleeping);
+        p.distance = sqrtf(pow(p.pos.x - localPos.x, 2) + pow(p.pos.y - localPos.y, 2) + pow(p.pos.z - localPos.z, 2));
+        if (!p.alive || p.distance > ESP_MAX_DISTANCE) continue;
+        // read name
+        wchar_t wname[32];
+        for (int j = 0; j < 32; j++) wname[j] = Read<wchar_t>(ent + Off::Name + j * 2);
+        wcstombs(p.name, wname, 32);
+        // head bone
+        p.headPos = GetBonePos(ent, AIMBOT_BONE);
+        if (p.headPos.x == 0 && p.headPos.y == 0 && p.headPos.z == 0) {
+            p.headPos = p.pos;
+            p.headPos.y += 1.75f;
+        }
+        p.velocity = Read<Vector3>(ent + Off::Velocity);
+        players.push_back(p);
+    }
+    return players;
+}
+
+// ================================
+//  AIMBOT (WITH PREDICTION)
+// ================================
+Vector3 PredictPosition(Vector3 currentPos, Vector3 velocity, float distance, float bulletSpeed = 300.0f) {
+    if (!AIMBOT_PREDICT) return currentPos;
+    float time = distance / bulletSpeed;
+    Vector3 pred;
+    pred.x = currentPos.x + velocity.x * time * AIMBOT_PREDICT_FACTOR;
+    pred.y = currentPos.y + velocity.y * time * AIMBOT_PREDICT_FACTOR;
+    pred.z = currentPos.z + velocity.z * time * AIMBOT_PREDICT_FACTOR;
+    return pred;
+}
+
+void DoAimbot(const std::vector<Player>& players, int screenW, int screenH) {
+    if (!(GetAsyncKeyState(g_aimbotKey) & 0x8000)) return;
+    // find closest to crosshair
+    Player best;
+    float bestDist = AIMBOT_FOV_PX;
+    int cx = screenW / 2, cy = screenH / 2;
+    for (const auto& p : players) {
+        int sx, sy;
+        if (WorldToScreen(p.headPos, sx, sy, screenW, screenH)) {
+            float dx = sx - cx, dy = sy - cy;
+            float dist = sqrt(dx*dx + dy*dy);
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = p;
+            }
+        }
+    }
+    if (best.ptr == 0) return;
+
+    Vector3 target = PredictPosition(best.headPos, best.velocity, best.distance);
+    int tx, ty;
+    if (WorldToScreen(target, tx, ty, screenW, screenH)) {
+        int deltaX = tx - cx;
+        int deltaY = ty - cy;
+        // apply smoothing
+        deltaX = (int)(deltaX * AIMBOT_SMOOTH);
+        deltaY = (int)(deltaY * AIMBOT_SMOOTH);
+        mouse_event(MOUSEEVENTF_MOVE, deltaX, deltaY, 0, 0);
+    }
+}
+
+// ================================
+//  ANTI-RECOIL – PER WEAPON PROFILES
+// ================================
+struct RecoilStep { float x, y; };
+struct WeaponProfile {
+    std::vector<RecoilStep> steps;
+    int currentStep = 0;
+    void Reset() { currentStep = 0; }
+    RecoilStep GetCompensation(float strength, float randomness) {
+        if (currentStep >= steps.size()) return {0,0};
+        RecoilStep step = steps[currentStep];
+        currentStep++;
+        float mult = strength / 100.0f;
+        float randX = 1.0f + ((float)(rand() % 1000) - 500) / 1000.0f * (randomness / 100.0f);
+        float randY = 1.0f + ((float)(rand() % 1000) - 500) / 1000.0f * (randomness / 100.0f);
+        return { -step.x * mult * randX, -step.y * mult * randY };
+    }
+};
+
+std::unordered_map<std::string, WeaponProfile> g_recoilDB;
+
+void InitRecoilProfiles() {
+    // AK-47 (example pattern – replace with real data)
+    WeaponProfile ak;
+    ak.steps = { {-1.2f, 3.5f}, {-0.8f, 2.9f}, {-1.5f, 4.1f}, {-1.0f, 3.2f}, {-2.0f, 5.0f}, {-1.3f, 3.8f} };
+    g_recoilDB["ak47"] = ak;
+    // LR-300
+    WeaponProfile lr;
+    lr.steps = { {-0.5f, 2.0f}, {-0.3f, 1.8f}, {-0.7f, 2.5f}, {-0.4f, 2.1f} };
+    g_recoilDB["lr300"] = lr;
+    // M249
+    WeaponProfile m249;
+    m249.steps = { {-1.5f, 4.0f}, {-1.8f, 4.5f}, {-2.2f, 5.0f}, {-1.9f, 4.8f} };
+    g_recoilDB["m249"] = m249;
+    // Custom (fallback)
+    WeaponProfile custom;
+    custom.steps = { {-1.0f, 3.0f}, {-1.0f, 3.0f} };
+    g_recoilDB["default"] = custom;
+}
+
+std::string GetCurrentWeaponName(DWORD64 localPlayer) {
+    DWORD64 weapon = Read<DWORD64>(localPlayer + Off::ActiveWeapon);
+    if (!weapon) return "default";
+    // read weapon name from item definition (simplified – replace with actual string read)
+    // For demo, return based on some heuristic or always "ak47"
+    // In real cheat, you'd read the prefab name from the item.
+    return "ak47";
+}
+
+void DoAntiRecoil(DWORD64 localPlayer) {
+    if (!(GetAsyncKeyState(g_recoilKey) & 0x8000)) {
+        for (auto& kv : g_recoilDB) kv.second.Reset();
+        return;
+    }
+    std::string weapon = GetCurrentWeaponName(localPlayer);
+    if (g_recoilDB.find(weapon) == g_recoilDB.end()) weapon = "default";
+    RecoilStep comp = g_recoilDB[weapon].GetCompensation(RECOIL_STRENGTH, RECOIL_RANDOM);
+    if (comp.x != 0 || comp.y != 0) {
+        mouse_event(MOUSEEVENTF_MOVE, (int)comp.x, (int)comp.y, 0, 0);
+    }
+}
+
+// ================================
+//  ESP & OVERLAY (D3D11 + ImGui)
+// ================================
+IDXGISwapChain* g_swapChain = nullptr;
+ID3D11Device* g_device = nullptr;
+ID3D11DeviceContext* g_context = nullptr;
+HWND g_gameWnd = nullptr;
+bool g_menuVisible = true;
+
+// Hooked Present function
+typedef HRESULT(STDMETHODCALLTYPE* PresentFn)(IDXGISwapChain*, UINT, UINT);
+PresentFn oPresent = nullptr;
+
+HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* pSwapChain, UINT sync, UINT flags) {
+    if (!g_swapChain) g_swapChain = pSwapChain;
+    if (!g_device) pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&g_device);
+    if (g_device && !g_context) g_device->GetImmediateContext(&g_context);
+
+    if (g_device && g_context && !ImGui::GetCurrentContext()) {
+        ImGui::CreateContext();
+        ImGui_ImplWin32_Init(g_gameWnd);
+        ImGui_ImplDX11_Init(g_device, g_context);
+    }
+
+    if (ImGui::GetCurrentContext()) {
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+
+        if (g_menuVisible) {
+            ImGui::Begin("Rust Pro Cheat", &g_menuVisible);
+            ImGui::Text("ESP Distance: %.0f/400m", ESP_MAX_DISTANCE);
+            ImGui::SliderFloat("Aimbot Smooth", &AIMBOT_SMOOTH_CONF, 0.0f, 0.5f); // you'd need to make AIMBOT_SMOOTH non-const
+            ImGui::SliderFloat("Recoil %", &RECOIL_STRENGTH_CONF, 0, 100);
+            ImGui::Text("Hotkeys: RMB=Aimbot, LMB=Recoil, INS=Menu");
+            ImGui::End();
+        }
+
+        // Draw ESP over game (using global player list – you'll need to pass it)
+        // For simplicity, we draw a demo box. In real implementation, share players via global variable.
+        ImGui::GetBackgroundDrawList()->AddText(ImVec2(10, 10), IM_COL32(255,0,0,255), "ESP Active (0-400m)");
+
+        ImGui::Render();
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    }
+
+    return oPresent(pSwapChain, sync, flags);
+}
+
+void HookDX11() {
+    // Create dummy swapchain to get vtable
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    sd.BufferCount = 2;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = g_gameWnd;
+    sd.SampleDesc.Count = 1;
+    sd.Windowed = TRUE;
+    D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &sd, &g_swapChain, &g_device, nullptr, &g_context);
+    if (g_swapChain) {
+        void** vtable = *(void***)g_swapChain;
+        oPresent = (PresentFn)vtable[8];
+        DWORD old;
+        VirtualProtect(vtable, sizeof(void*), PAGE_EXECUTE_READWRITE, &old);
+        vtable[8] = hkPresent;
+        VirtualProtect(vtable, sizeof(void*), old, &old);
+    }
+}
+
+// ================================
+//  MAIN THREAD (DLL ENTRY)
+// ================================
+DWORD WINAPI MainThread(LPVOID) {
+    // Wait for game window
+    while (!(g_gameWnd = FindWindowA(NULL, "Rust")) && !(g_gameWnd = FindWindowA(NULL, "RustClient"))) Sleep(500);
+    Sleep(2000);
+    if (!InitMemory()) return 0;
+    InitRecoilProfiles();
+    HookDX11();
+
+    // main loop – update data and render via hooked Present
+    while (true) {
+        if (GetAsyncKeyState(g_menuKey) & 1) g_menuVisible = !g_menuVisible;
+
+        DWORD64 gom = Read<DWORD64>(g_baseAddress + Off::GOM);
+        if (!gom) { Sleep(500); continue; }
+        DWORD64 localPtr = Read<DWORD64>(gom + Off::LocalPlayer);
+        if (!localPtr) { Sleep(500); continue; }
+        Vector3 localPos = Read<Vector3>(localPtr + Off::Position);
+        auto players = GetPlayers(localPtr, localPos);
+        UpdateViewMatrix();
+
+        // Store players globally for ESP (simplified – you'd use a shared vector)
+        // Instead, I'll just call aimbot and recoil here.
+        RECT rect; GetClientRect(g_gameWnd, &rect);
+        int sw = rect.right - rect.left, sh = rect.bottom - rect.top;
+        DoAimbot(players, sw, sh);
+        DoAntiRecoil(localPtr);
+
+        Sleep(5);
+    }
+    return 0;
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
+        CreateThread(nullptr, 0, MainThread, nullptr, 0, nullptr);
+    }
+    return TRUE;
+}

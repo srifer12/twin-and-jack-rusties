@@ -1,0 +1,435 @@
+1. dllmain.cpp – Entry point, thread creation, PEB unlinking
+cpp
+#include <Windows.h>
+#include "memory.h"
+#include "offsets.h"
+#include "ui.h"
+#include "aimbot.h"
+#include "aimassist.h"
+#include "esp.h"
+#include "bypass.h"
+
+HANDLE hGameThread = nullptr;
+HANDLE hLogicThread = nullptr;
+
+DWORD WINAPI GameThread(LPVOID) {
+    // Wait for game window and D3D11 device
+    while (!(g_hwnd = FindWindowA(NULL, "Rust")) && !(g_hwnd = FindWindowA(NULL, "RustClient"))) Sleep(100);
+    
+    // Hook DX11 Present (using VMT hooking – standard method)
+    if (!UI::HookPresent()) {
+        MessageBoxA(g_hwnd, "Failed to hook Present", "Error", MB_OK);
+        return 0;
+    }
+    
+    // ImGui init inside hooked Present
+    while (true) Sleep(1000);
+    return 0;
+}
+
+DWORD WINAPI LogicThread(LPVOID) {
+    // Resolve offsets once at startup
+    OffsetResolver::Initialize();
+    
+    while (g_running) {
+        uintptr_t localPlayer = Memory::ReadChain(Off::LocalPlayerChain);
+        if (!localPlayer) { Sleep(200); continue; }
+        
+        Vector3 localPos = Memory::Read<Vector3>(localPlayer + Off::Position);
+        auto entities = ESP::GetEntitiesInRange(localPos, UI::GetEspRange());
+        
+        if (UI::IsAimbotActive() && UI::IsAimbotKeyHeld()) {
+            Aimbot::Run(localPlayer, entities);
+        }
+        
+        if (UI::IsAimAssistActive() && UI::IsAimAssistKeyHeld()) {
+            AimAssist::Run(localPlayer, entities);
+        }
+        
+        UI::UpdateEntities(entities);
+        Memory::RandomSleep(1, 5);  // anti‑pattern
+    }
+    return 0;
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
+        // Hide DLL from PEB
+        Bypass::UnlinkFromPEB(hModule);
+        
+        // Spawn threads
+        hGameThread = CreateThread(nullptr, 0, GameThread, nullptr, 0, nullptr);
+        hLogicThread = CreateThread(nullptr, 0, LogicThread, nullptr, 0, nullptr);
+    }
+    return TRUE;
+}
+2. memory.h / memory.cpp – Direct syscalls + pattern scanning
+cpp
+// memory.h
+#pragma once
+#include <Windows.h>
+#include <vector>
+#include <random>
+
+namespace Memory {
+    void InitSyscalls();
+    template<typename T> T Read(uintptr_t addr);
+    template<typename T> void Write(uintptr_t addr, T value);
+    uintptr_t ReadChain(const std::vector<uintptr_t>& offsets);
+    uintptr_t PatternScan(const char* module, const char* pattern, const char* mask);
+    void RandomSleep(int minMs, int maxMs);
+}
+cpp
+// memory.cpp
+#include "memory.h"
+
+// Syscall stubs (retrieved from ntdll at runtime)
+static NTSTATUS (NTAPI *NtReadVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T) = nullptr;
+static NTSTATUS (NTAPI *NtWriteVirtualMemory)(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T) = nullptr;
+
+void Memory::InitSyscalls() {
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    NtReadVirtualMemory = (decltype(NtReadVirtualMemory))GetProcAddress(ntdll, "NtReadVirtualMemory");
+    NtWriteVirtualMemory = (decltype(NtWriteVirtualMemory))GetProcAddress(ntdll, "NtWriteVirtualMemory");
+}
+
+template<typename T>
+T Memory::Read(uintptr_t addr) {
+    T buffer{};
+    NtReadVirtualMemory(GetCurrentProcess(), (PVOID)addr, &buffer, sizeof(T), nullptr);
+    RandomSleep(1, 5);
+    return buffer;
+}
+
+uintptr_t Memory::PatternScan(const char* module, const char* pattern, const char* mask) {
+    // Standard pattern scan implementation (omitted for brevity)
+    // Returns first match address
+}
+
+void Memory::RandomSleep(int minMs, int maxMs) {
+    static std::mt19937 rng(std::chrono::steady_clock::now().time_since_epoch().count());
+    static std::uniform_int_distribution<int> dist(minMs, maxMs);
+    Sleep(dist(rng));
+}
+3. offsets.cpp / offsets.h – Dynamic resolver with pattern database
+cpp
+// offsets.h
+#pragma once
+#include <cstdint>
+
+enum OffsetID {
+    LocalPlayerChain,
+    Position, Health, MaxHealth, Name, Team, SleepingFlag,
+    Model, BoneTransforms, Velocity, ViewMatrix,
+    ActiveWeapon, WeaponName, InventoryContainers,
+    EntityList, EntityCount, // ... many more
+};
+
+class OffsetResolver {
+public:
+    static void Initialize();
+    static uintptr_t Get(OffsetID id);
+    static void UpdateViewMatrix();
+private:
+    static uintptr_t offsets[256];
+    static void ScanPatterns();
+};
+cpp
+// offsets.cpp
+#include "offsets.h"
+#include "memory.h"
+
+uintptr_t OffsetResolver::offsets[256];
+
+void OffsetResolver::Initialize() {
+    ScanPatterns();
+}
+
+void OffsetResolver::ScanPatterns() {
+    // Example pattern for LocalPlayer chain
+    uintptr_t addr = Memory::PatternScan("GameAssembly.dll",
+        "\x48\x8B\x0D\x00\x00\x00\x00\x48\x85\xC9\x74\x00\xE8",
+        "xxx????xxxx?x");
+    if (addr) {
+        offsets[LocalPlayerChain] = addr + *(int32_t*)(addr + 3) + 7;
+    }
+    // Repeat for all offsets – at least 30 patterns
+    // ... (full implementation would be ~200 lines)
+}
+
+uintptr_t OffsetResolver::Get(OffsetID id) {
+    return offsets[id];
+}
+4. aimbot.cpp / aimbot.h – Smoothing, RCS, bone lock
+cpp
+// aimbot.h
+#pragma once
+#include <vector>
+#include "esp.h"
+
+namespace Aimbot {
+    void Run(uintptr_t localPlayer, const std::vector<Entity>& entities);
+    void SetBone(int bone);
+    void SetSmoothing(float smooth);
+    void SetRCSStrength(float strength);
+}
+cpp
+// aimbot.cpp (partial – core logic)
+#include "aimbot.h"
+#include "memory.h"
+#include "offsets.h"
+#include "ui.h"
+#include <cmath>
+#include <random>
+
+static int g_bone = 48; // head
+static float g_smooth = 50.0f;
+static float g_rcs = 85.0f;
+
+static Vector3 CubicBezier(Vector3 start, Vector3 end, float t) {
+    float t2 = t * t, t3 = t2 * t;
+    return start + (end - start) * (3 * t2 - 2 * t3);
+}
+
+void Aimbot::Run(uintptr_t localPlayer, const std::vector<Entity>& entities) {
+    Entity target = SelectTarget(entities, UI::GetTargetPriority());
+    if (!target.ptr) return;
+    
+    Vector3 targetHead = GetBonePos(target.ptr, g_bone);
+    if (!IsVisible(localPlayer, target.ptr)) return; // ray trace
+    
+    Vector3 localAngles = GetViewAngles(localPlayer);
+    Vector3 needed = CalcAngles(localPlayer, targetHead);
+    Vector3 delta = needed - localAngles;
+    
+    // Smoothing: 0 = instant, 100 = cubic bezier with jitter
+    float factor = 1.0f - (g_smooth / 100.0f);
+    if (g_smooth > 90.0f) {
+        // Humanized: random delay + over‑correction
+        static std::mt19937 rng(std::chrono::steady_clock::now().time_since_epoch().count());
+        std::uniform_real_distribution<float> jitter(-0.5f, 0.5f);
+        delta.x += jitter(rng);
+        delta.y += jitter(rng);
+        float t = (100.0f - g_smooth) / 100.0f;
+        Vector3 newAngles = CubicBezier(localAngles, needed, t);
+        SetViewAngles(localPlayer, newAngles);
+        Sleep(std::uniform_int_distribution<int>(10, 30)(rng));
+    } else {
+        Vector3 newAngles = localAngles + delta * factor;
+        SetViewAngles(localPlayer, newAngles);
+    }
+    
+    // RCS
+    if (g_rcs > 0.0f && IsShooting(localPlayer)) {
+        Vector2 punch = GetRecoilPunch(localPlayer);
+        Vector2 correction = {-punch.x * (g_rcs/100.0f), -punch.y * (g_rcs/100.0f)};
+        ApplyMouseMovement((int)correction.x, (int)correction.y);
+    }
+}
+5. aimassist.cpp – Magnetic force vector (no angle writes)
+cpp
+#include "aimassist.h"
+#include "ui.h"
+#include "memory.h"
+
+void AimAssist::Run(uintptr_t localPlayer, const std::vector<Entity>& entities) {
+    if (!IsADS(localPlayer) && !UI::IsAimAssistForceKeyHeld()) return;
+    
+    float radius = UI::GetAimAssistRadius();
+    float strength = UI::GetAimAssistStrength() / 100.0f;
+    Entity closest = GetClosestToCrosshair(entities, radius);
+    if (!closest.ptr) return;
+    
+    Vector3 targetScreen = WorldToScreen(closest.headPos);
+    Vector3 crosshairCenter = { UI::GetScreenWidth() / 2, UI::GetScreenHeight() / 2 };
+    Vector3 force = targetScreen - crosshairCenter;
+    float mag = sqrt(force.x*force.x + force.y*force.y);
+    if (mag < 1.0f) return;
+    
+    // Dynamic acceleration: stronger when closer
+    float pull = strength * (1.0f - (mag / radius));
+    force.x *= pull;
+    force.y *= pull;
+    
+    // Apply via SendInput (relative move)
+    INPUT input = {0};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE;
+    input.mi.dx = (int)force.x;
+    input.mi.dy = (int)force.y;
+    SendInput(1, &input, sizeof(INPUT));
+}
+6. esp.cpp – Entity iteration, drawing (via ImDrawList)
+cpp
+#include "esp.h"
+#include "memory.h"
+#include "offsets.h"
+#include "ui.h"
+#include <imgui.h>
+
+std::vector<Entity> ESP::GetEntitiesInRange(Vector3 localPos, float maxRange) {
+    std::vector<Entity> result;
+    uintptr_t entityList = Memory::ReadChain(Off::EntityListChain);
+    int count = Memory::Read<int>(entityList + Off::EntityCount);
+    for (int i = 0; i < count; i++) {
+        uintptr_t ent = Memory::Read<uintptr_t>(entityList + i * 8);
+        if (!ent) continue;
+        Entity e;
+        e.ptr = ent;
+        e.pos = Memory::Read<Vector3>(ent + Off::Position);
+        e.distance = localPos.Distance(e.pos);
+        if (e.distance > maxRange) continue;
+        e.health = Memory::Read<float>(ent + Off::Health);
+        e.name = ReadName(ent);
+        e.activeWeapon = ReadWeaponName(ent);
+        e.hotbarItems = ReadHotbar(ent);
+        e.inventoryValuables = ReadInventoryPreview(ent);
+        e.isFriend = UI::IsFriend(e.name);
+        result.push_back(e);
+    }
+    return result;
+}
+
+void ESP::DrawEntity(const Entity& e, ImDrawList* draw, int screenW, int screenH) {
+    Vector3 feet = e.pos, head = e.pos; head.y += 1.75f;
+    int fx, fy, hx, hy;
+    if (!WorldToScreen(feet, fx, fy) || !WorldToScreen(head, hx, hy)) return;
+    
+    float height = fy - hy;
+    float width = height * 0.6f;
+    int left = hx - width/2;
+    
+    ImU32 color = e.isFriend ? IM_COL32(0,255,0,255) : IM_COL32(255,0,0,255);
+    draw->AddRect(ImVec2(left, hy), ImVec2(left+width, fy), color, 2.0f);
+    draw->AddText(ImVec2(left, hy-15), IM_COL32(255,255,255,255), e.name.c_str());
+    char dist[32]; sprintf_s(dist, "%.0fm", e.distance);
+    draw->AddText(ImVec2(left+width+5, hy+height/2), IM_COL32(255,255,255,255), dist);
+    // Health bar, weapon, hotbar, inventory preview, etc.
+}
+7. ui.cpp – ImGui with tabs, sliders, hotkeys, config saving
+cpp
+#include "ui.h"
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx11.h"
+#include <fstream>
+#include <nlohmann/json.hpp>
+
+static bool g_showMenu = true;
+static bool g_aimbotEnabled = true, g_aimAssistEnabled = true, g_espEnabled = true;
+static float g_aimbotSmooth = 50.0f, g_rcsStrength = 85.0f, g_espRange = 400.0f;
+static int g_aimbotKey = VK_RBUTTON, g_aimAssistKey = VK_LMENU, g_menuKey = VK_INSERT;
+
+void UI::RenderLoop() {
+    while (true) {
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+        
+        if (g_showMenu) {
+            ImGui::Begin("Rust Internal Pro", &g_showMenu, ImGuiWindowFlags_NoCollapse);
+            if (ImGui::BeginTabBar("MainTabs")) {
+                if (ImGui::BeginTabItem("Aimbot")) {
+                    ImGui::Checkbox("Enable Aimbot", &g_aimbotEnabled);
+                    ImGui::SliderFloat("Smoothing (0=snap,100=human)", &g_aimbotSmooth, 0, 100);
+                    ImGui::SliderFloat("RCS Strength %", &g_rcsStrength, 0, 100);
+                    ImGui::Combo("Bone", &g_aimbotBone, "Head\0Neck\0Chest\0");
+                    ImGui::Combo("Target Priority", &g_targetPriority, "Crosshair\0Distance\0Lowest Health\0");
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Aim Assist")) {
+                    ImGui::Checkbox("Enable Aim Assist", &g_aimAssistEnabled);
+                    ImGui::SliderFloat("Strength", &g_aimAssistStrength, 0, 100);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("ESP")) {
+                    ImGui::Checkbox("Enable ESP", &g_espEnabled);
+                    ImGui::SliderFloat("Range (m)", &g_espRange, 0, 400);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Hotkeys")) {
+                    // Hotkey buttons (set key)
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+            }
+            ImGui::End();
+        }
+        
+        // Draw ESP over game
+        if (g_espEnabled) {
+            for (auto& e : g_entities) ESP::DrawEntity(e, ImGui::GetBackgroundDrawList(), screenW, screenH);
+        }
+        
+        ImGui::Render();
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        Sleep(16);
+    }
+}
+8. bypass.cpp – PEB unlinking, syscall init, anti‑hook checks
+cpp
+#include "bypass.h"
+#include <winternl.h>
+
+void Bypass::UnlinkFromPEB(HMODULE hModule) {
+    PPEB peb = reinterpret_cast<PPEB>(__readgsqword(0x60));
+    PEB_LDR_DATA* ldr = peb->Ldr;
+    LIST_ENTRY* head = &ldr->InMemoryOrderModuleList;
+    LIST_ENTRY* curr = head->Flink;
+    
+    while (curr != head) {
+        LDR_DATA_TABLE_ENTRY* entry = CONTAINING_RECORD(curr, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
+        if (entry->DllBase == hModule) {
+            // Unlink
+            curr->Blink->Flink = curr->Flink;
+            curr->Flink->Blink = curr->Blink;
+            break;
+        }
+        curr = curr->Flink;
+    }
+}
+
+void Bypass::AntiHookCheck() {
+    // Compare first bytes of memcpy to known good bytes
+    uint8_t* memcpyPtr = (uint8_t*)GetProcAddress(GetModuleHandleA("ntdll.dll"), "memcpy");
+    uint8_t cleanBytes[] = { 0x4C, 0x8B, 0xD1, 0xB8, 0xCC }; // example
+    if (memcmp(memcpyPtr, cleanBytes, 5) != 0) {
+        // Hook detected – crash or fallback
+        ExitProcess(0);
+    }
+}
+9. update_offsets.py – Python scraper for latest Rust offsets
+python
+import requests
+import re
+import configparser
+
+url = "https://raw.githubusercontent.com/SomeDude/RustOffsets/main/offsets.ini"
+resp = requests.get(url)
+config = configparser.ConfigParser()
+config.read_string(resp.text)
+with open("offsets.ini", "w") as f:
+    config.write(f)
+print("Offsets updated.")
+10. injector/injector.cpp – Simple LoadLibrary injector with PEB cleaning
+cpp
+#include <Windows.h>
+#include <TlHelp32.h>
+
+DWORD GetProcessId(const char* processName) {
+    // ...
+}
+
+int main() {
+    DWORD pid = GetProcessId("RustClient.exe");
+    HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    void* remoteMem = VirtualAllocEx(hProc, NULL, 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    WriteProcessMemory(hProc, remoteMem, "C:\\cheat.dll", 13, NULL);
+    HANDLE hThread = CreateRemoteThread(hProc, NULL, 0, (LPTHREAD_START_ROUTINE)LoadLibraryA, remoteMem, 0, NULL);
+    WaitForSingleObject(hThread, INFINITE);
+    // Optionally hide the DLL after injection via remote PEB unlinking
+    CloseHandle(hProc);
+    return 0;
+}
+
